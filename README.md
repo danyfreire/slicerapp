@@ -1,14 +1,22 @@
 # SlicerApp local
 
-MVP local para generar clips verticales con hooks editables quemados sobre el video.
+SlicerApp es una app local para convertir videos largos o medianos en clips verticales cortos con textos tipo hook quemados sobre el video.
+
+El objetivo del MVP es funcionar primero en tu máquina:
+
+- Frontend: Next.js + React + Tailwind.
+- Backend local: Python + FastAPI.
+- Video: FFmpeg.
+- Hooks: plantillas locales, hooks pegados, Ollama local u OpenAI API opcional.
+- Estado: JSON local, sin login y sin base de datos.
 
 ## Estructura
 
-- `frontend/`: Next.js + React + Tailwind.
-- `backend/`: FastAPI + FFmpeg + generadores de hooks.
+- `frontend/`: interfaz web.
+- `backend/`: API local, generación de hooks y render con FFmpeg.
 - `uploads/`: videos originales subidos.
 - `outputs/`: clips renderizados.
-- `backend/state/jobs.json`: estado local del flujo.
+- `backend/state/jobs.json`: estado local de jobs y clips.
 
 ## Requisitos
 
@@ -17,37 +25,20 @@ MVP local para generar clips verticales con hooks editables quemados sobre el vi
 3. FFmpeg y ffprobe instalados y disponibles en `PATH`.
 4. Opcional: Ollama local u OpenAI API si quieres hooks generados por un LLM.
 
-En Windows, si te faltan Python o FFmpeg:
+En Windows, si faltan Python o FFmpeg:
 
 ```powershell
 winget install Python.Python.3.12
 winget install Gyan.FFmpeg
 ```
 
-Después cierra y vuelve a abrir la terminal para refrescar `PATH`.
+Cierra y vuelve a abrir la terminal para refrescar `PATH`.
 
 Comprueba FFmpeg:
 
 ```powershell
 ffmpeg -version
 ffprobe -version
-```
-
-## Modos de hooks
-
-SlicerApp tiene cuatro modos:
-
-- `Plantillas locales gratis`: no usa internet ni API key. Usa frases locales y adapta algunas al contexto que escribas.
-- `Pegar mis hooks`: puedes pedir hooks en ChatGPT, copiarlos y pegarlos en la app, uno por línea.
-- `Ollama local gratis`: usa un modelo local si tienes Ollama corriendo en tu máquina. Si Ollama no responde, vuelve a plantillas locales.
-- `OpenAI API opcional`: usa `OPENAI_API_KEY` si más adelante decides usar la API.
-
-Para Ollama:
-
-```powershell
-winget install Ollama.Ollama
-ollama pull llama3.2
-ollama serve
 ```
 
 ## Configuración
@@ -58,7 +49,9 @@ Desde la raíz del proyecto:
 Copy-Item .env.example backend\.env
 ```
 
-Puedes dejar `OPENAI_API_KEY` vacío. Si usas Ollama, revisa que estos valores existan en `backend\.env`:
+Puedes dejar `OPENAI_API_KEY` vacío. SlicerApp funciona sin pagar API usando plantillas locales o hooks pegados.
+
+Si usas Ollama, revisa estos valores en `backend\.env`:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
@@ -100,17 +93,99 @@ cd frontend
 npm.cmd run dev
 ```
 
-Abre `http://localhost:3000`.
+Abre:
 
-## Flujo
+```text
+http://localhost:3000
+```
+
+## Flujo de uso
 
 1. Sube un video.
-2. Ajusta duración de clip, máximo de clips e intervalo entre cortes.
-3. Elige modo de hooks y escribe el contexto del video.
-4. Genera propuestas de cortes y hooks.
-5. Aprueba, edita o descarta cada texto.
-6. Renderiza los clips aprobados.
-7. Descarga desde la pantalla final o abre los archivos en `outputs/<job-id>/`.
+2. Ajusta duración del clip, máximo de clips e intervalo entre cortes.
+3. Elige modo de hooks.
+4. Escribe el contexto del video si quieres orientar los textos.
+5. Genera propuestas de cortes y hooks.
+6. Aprueba, edita o descarta cada texto.
+7. Renderiza los clips aprobados.
+8. Descarga desde la pantalla final o abre los archivos en `outputs/<job-id>/`.
+
+## Modos de hooks
+
+SlicerApp tiene cuatro modos:
+
+- `Plantillas locales gratis`: no usa internet ni API key. Usa frases locales y adapta algunas al contexto escrito.
+- `Pegar mis hooks`: puedes pedir hooks en ChatGPT y pegarlos en la app, uno por línea.
+- `Ollama local gratis`: usa un modelo local si tienes Ollama corriendo. Si Ollama no responde, vuelve a plantillas locales.
+- `OpenAI API opcional`: usa `OPENAI_API_KEY` si más adelante decides usar la API.
+
+Ejemplo de contexto:
+
+```text
+Grabación casera de guitarras y voces, textura nostálgica, proceso indie, errores bonitos y tomas imperfectas.
+```
+
+Ejemplo de hooks para pegar:
+
+```text
+A veces una toma imperfecta dice más que una versión demasiado limpia.
+Esto no está terminado todavía, pero ya tiene una vibra que me pide seguir.
+Hay sonidos que funcionan porque parecen encontrados, no planeados.
+```
+
+## Usar Ollama gratis
+
+Instala Ollama:
+
+```powershell
+winget install Ollama.Ollama
+```
+
+Descarga un modelo:
+
+```powershell
+ollama pull llama3.2
+```
+
+Levanta Ollama:
+
+```powershell
+ollama serve
+```
+
+Luego en SlicerApp elige `Ollama local gratis`.
+
+## Render de texto
+
+El texto se renderiza con FFmpeg:
+
+- formato vertical `1080x1920`
+- video centrado con crop automático
+- hook centrado horizontal y verticalmente
+- fondo semitransparente detrás del texto
+- salida en `outputs/<job-id>/`
+
+Si cambias código del backend, reinicia FastAPI y vuelve a renderizar los clips aprobados.
+
+## GitHub
+
+Flujo recomendado para guardar cambios:
+
+```powershell
+git status
+git add .
+git commit -m "Describe el cambio"
+git push
+```
+
+En otra máquina:
+
+```powershell
+git clone https://github.com/danyfreire/slicerapp.git
+cd slicerapp
+```
+
+Luego instala dependencias siguiendo las secciones anteriores.
 
 ## Notas
 
@@ -118,4 +193,5 @@ Abre `http://localhost:3000`.
 - Para una opción gratis con LLM, usa Ollama local o pega hooks generados desde ChatGPT.
 - El procesamiento pesado corre en FastAPI local con FFmpeg, no en Vercel.
 - Vercel solo sería útil luego para desplegar la interfaz Next.js.
-- No hay login ni base de datos; el estado se guarda como JSON local.
+- No subas `backend\.env`; ya está ignorado por Git.
+- No hay login ni base de datos todavía; el estado se guarda como JSON local.
