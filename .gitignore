@@ -1,0 +1,12 @@
+backend/.env
+backend/.venv/
+frontend/.next/
+frontend/node_modules/
+uploads/*
+outputs/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+backend/state/jobs.json
+__pycache__/
+*.pyc
+*.log
