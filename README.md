@@ -78,6 +78,26 @@ npm.cmd install
 
 ## Correr localmente
 
+Opción rápida desde la raíz del proyecto:
+
+```powershell
+.\start-dev.bat
+```
+
+Para detener backend y frontend:
+
+```powershell
+.\stop-dev.bat
+```
+
+Para reiniciar ambos:
+
+```powershell
+.\restart-dev.bat
+```
+
+Opción manual:
+
 Backend:
 
 ```powershell
@@ -112,11 +132,10 @@ http://localhost:3000
 
 ## Modos de hooks
 
-SlicerApp tiene cuatro modos:
+SlicerApp tiene tres modos:
 
-- `Plantillas locales gratis`: no usa internet ni API key. Usa frases locales y adapta algunas al contexto escrito.
-- `Pegar mis hooks`: puedes pedir hooks en ChatGPT y pegarlos en la app, uno por línea.
-- `Ollama local gratis`: usa un modelo local si tienes Ollama corriendo. Si Ollama no responde, vuelve a plantillas locales.
+- `Pegar mis hooks`: puedes crear un prompt desde la app, copiarlo en ChatGPT u otro LLM, y pegar el resultado en la app, un hook por línea.
+- `Ollama local`: usa un modelo local si tienes Ollama corriendo.
 - `OpenAI API opcional`: usa `OPENAI_API_KEY` si más adelante decides usar la API.
 
 Ejemplo de contexto:

@@ -7,6 +7,8 @@ outputs/*
 !uploads/.gitkeep
 !outputs/.gitkeep
 backend/state/jobs.json
+backend/state/*.json
 __pycache__/
 *.pyc
 *.log
+.slicerapp-dev-pids.json

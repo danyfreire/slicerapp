@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import traceback
 import textwrap
 import urllib.error
 import urllib.request
@@ -32,8 +33,8 @@ STATE_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="SlicerApp Local API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,10 +45,25 @@ class ClipUpdate(BaseModel):
     status: Literal["pending", "approved", "discarded"] | None = None
 
 
+class BulkStatusUpdate(BaseModel):
+    status: Literal["pending", "approved", "discarded"]
+
+
+class SelectedStatusUpdate(BaseModel):
+    clip_ids: list[str]
+    status: Literal["pending", "approved", "discarded"]
+
+
 def load_jobs() -> dict:
     if not STATE_FILE.exists():
         return {}
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        backup_path = STATE_FILE.with_suffix(f".corrupt-{uuid.uuid4().hex[:8]}.json")
+        shutil.copyfile(STATE_FILE, backup_path)
+        STATE_FILE.write_text("{}", encoding="utf-8")
+        return {}
 
 
 def save_jobs(jobs: dict) -> None:
@@ -88,63 +104,86 @@ def build_clip_windows(duration: float, clip_duration: float, max_clips: int, in
     if duration < clip_duration:
         raise HTTPException(status_code=400, detail="La duración del video es insuficiente para el clip solicitado.")
 
-    clips = []
+    available_windows = []
     start = 0.0
-    index = 1
-    while start + clip_duration <= duration + 0.001 and len(clips) < max_clips:
+    while start + clip_duration <= duration + 0.001:
+        available_windows.append((round(start, 2), round(start + clip_duration, 2)))
+        start += interval
+
+    if not available_windows:
+        raise HTTPException(status_code=400, detail="No se pudieron generar ventanas de corte para este video.")
+
+    clips = []
+    for index in range(1, max_clips + 1):
+        start, end = available_windows[(index - 1) % len(available_windows)]
         clips.append(
             {
                 "id": str(uuid.uuid4()),
                 "index": index,
-                "start": round(start, 2),
-                "end": round(start + clip_duration, 2),
+                "start": start,
+                "end": end,
                 "hook": "",
                 "status": "pending",
                 "output_path": None,
+                "cycle": ((index - 1) // len(available_windows)) + 1,
             }
         )
-        start += interval
-        index += 1
     return clips
 
 
-def fallback_hooks(clips: list[dict], video_context: str = "") -> list[str]:
-    context = video_context.strip()
-    seeds = [
-        "A veces un riff suena mejor cuando parece que lo encontraste por accidente.",
-        "Este tono de guitarra tiene algo entre nostalgia, ruido y ganas de no explicar nada.",
-        "No sé si esto es una canción todavía, pero ya tiene una vibra que me dice que siga.",
-        "El truco no es tocar perfecto, es encontrar ese sonido que te hace quedarte un segundo más.",
-        "Hay riffs que no piden permiso: entran con fuzz, se quedan flotando y te cambian el ánimo.",
-        "Ese fuzz no está tratando de sonar limpio; está tratando de dejar una marca rara en la memoria.",
-        "Hay algo retro en este riff, como si hubiera salido de una cinta perdida y todavía quisiera pelear.",
-        "Si este sonido se siente medio roto, probablemente por eso mismo me dan ganas de repetirlo.",
-        "No todo riff necesita explicar hacia dónde va; algunos solo necesitan abrir una puerta y hacer ruido.",
-        "Esto empezó como una idea suelta, pero el sonido decidió que era más importante de lo planeado.",
-        "Hay momentos de grabación que no se sienten perfectos, pero sí honestos, y eso suele durar más.",
-        "A veces la toma que ibas a borrar es justo la que tiene algo que no se puede repetir.",
-        "No siempre se trata de mostrar una canción terminada; a veces basta con mostrar la chispa.",
-        "Este pedazo todavía está crudo, pero ya tiene esa pequeña tensión que hace que quieras escucharlo otra vez.",
-    ]
-    if context:
-        seeds.extend(
-            [
-                f"Esto va sobre {context}, pero sin explicarlo demasiado: solo dejando que el momento respire.",
-                f"Si este clip tiene una idea central, está en esa sensación de {context} que aparece sin pedir permiso.",
-                f"Hay algo en {context} que funciona mejor cuando se siente directo, imperfecto y cerca.",
-            ]
-        )
+def sanitize_hook(text: str) -> str:
+    cleaned = str(text).strip()
+    cleaned = re.sub(r"^\s*(?:[-*]|\d+[\).\-\:])\s*", "", cleaned)
+    cleaned = cleaned.strip(" \"'“”‘’")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s*\(\d+(?:\.\d+)?s-\d+(?:\.\d+)?s\)\s*$", "", cleaned)
+    cleaned = re.sub(r"\b\d+\s*(?:segundos?|secs?|seconds?)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bsiete\s+segundos?\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:en|durante|para)\s+segundos?\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:hooks?|clips?|videos?)\s*:?\s*", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip(" .,:;") + "." if cleaned and not cleaned.endswith((".", "?", "!")) else cleaned
+
+
+def normalize_hooks(raw_hooks: list, clips: list[dict]) -> list[str]:
     hooks = []
-    for i, clip in enumerate(clips):
-        base = seeds[i % len(seeds)]
-        hooks.append(base)
-    return hooks
+    relaxed_hooks = []
+    forbidden = re.compile(
+        r"\b(?:segundos?|seconds?|secs?|duraci[oó]n|hooks?|clips?|videos?|tiktok|reels|shorts)\b",
+        re.IGNORECASE,
+    )
+    cliches = re.compile(r"\b(?:mi alma|pasión en cada nota|secretos olvidados)\b", re.IGNORECASE)
+    for item in raw_hooks:
+        cleaned = sanitize_hook(str(item))
+        words = cleaned.split()
+        if cleaned and 8 <= len(words) <= 22 and not forbidden.search(cleaned) and not cliches.search(cleaned):
+            hooks.append(cleaned)
+        elif cleaned and len(words) >= 5 and not forbidden.search(cleaned) and not cliches.search(cleaned):
+            relaxed_hooks.append(cleaned)
+    if len(hooks) < len(clips):
+        hooks.extend([hook for hook in relaxed_hooks if hook not in hooks])
+    if not hooks:
+        return []
+    return [hooks[index % len(hooks)] for index in range(len(clips))]
+
+
+def extract_hook_list(parsed) -> list:
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("hooks", "hook_texts", "texts", "frases", "_hooks"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return value
+        for value in parsed.values():
+            if isinstance(value, list):
+                return value
+    return []
 
 
 def parse_manual_hooks(manual_hooks: str, count: int) -> list[str]:
     hooks = []
     for line in manual_hooks.splitlines():
-        cleaned = re.sub(r"^\s*(?:[-*]|\d+[\).\-\:])\s*", "", line).strip()
+        cleaned = sanitize_hook(line)
         if cleaned:
             hooks.append(cleaned)
     if not hooks:
@@ -152,30 +191,136 @@ def parse_manual_hooks(manual_hooks: str, count: int) -> list[str]:
     return [hooks[i % len(hooks)] for i in range(count)]
 
 
-def hooks_prompt(count: int, video_context: str) -> str:
-    context = video_context.strip() or (
+def hooks_prompt(
+    count: int,
+    video_context: str,
+    hook_objective: str,
+    hook_tone: str,
+    hook_type: str,
+    clip_duration: float,
+    output_format: str = "json",
+) -> str:
+    description = video_context.strip() or (
         "un video musical corto; puede ser guitarra, grabación casera, producción, ensayo, "
         "ideas en proceso o momentos creativos"
     )
+    objective = hook_objective.strip() or "hacer que la persona siga leyendo y quiera ver qué pasa"
+    tone = hook_tone.strip() or "humano, emocional, natural, con curiosidad y tensión"
+    hook_style = hook_type.strip() or "curiosidad"
+    max_words = 20 if clip_duration <= 7 else 24
+    if output_format == "lines":
+        output_rules = (
+            "Devuelve solo los textos listos para copiar y pegar.\n\n"
+            "Formato exacto:\n"
+            "- un hook por línea\n"
+            "- sin JSON\n"
+            "- sin comillas\n"
+            "- sin numeración\n"
+            "- sin bullets\n"
+            "- sin explicaciones antes o después"
+        )
+    else:
+        output_rules = (
+            "Devuelve únicamente JSON válido.\n\n"
+            "Formato exacto:\n"
+            "{\"hooks\":[\"texto 1\",\"texto 2\"]}\n\n"
+            "No agregues texto fuera del JSON."
+        )
     return (
-        f"Genera exactamente {count} hooks en español para clips verticales cortos. "
-        f"Contexto del video: {context}. "
-        "Deben ser frases un poco largas, naturales, con vibra poética pero clara, "
-        "pensadas para retener lectura mientras se ve el clip. "
-        "Evita hashtags, emojis, comillas, numeración y explicaciones. "
-        "Responde solo un arreglo JSON de strings."
+        "Actúa como un experto en hooks virales para contenido corto vertical.\n\n"
+        "Tu tarea es generar textos altamente adictivos para overlays de videos cortos.\n\n"
+        "NO debes mencionar plataformas, marketing, hooks ni redes sociales.\n\n"
+        "La persona usuaria te dará:\n"
+        "- una descripción visual\n"
+        "- un objetivo comunicacional\n"
+        "- un tono emocional\n"
+        "- un tipo psicológico de hook\n\n"
+        "Tu trabajo es generar hooks que hagan que la persona siga leyendo hasta el final.\n\n"
+        f"DESCRIPCIÓN DEL VIDEO:\n{description}\n\n"
+        f"OBJETIVO DEL HOOK:\n{objective}\n\n"
+        f"TONO:\n{tone}\n\n"
+        f"TIPO DE HOOK:\n{hook_style}\n\n"
+        f"Genera exactamente {count} hooks.\n\n"
+        "Cada hook debe:\n"
+        f"- tener entre 11 y {max_words} palabras\n"
+        "- sentirse humano y natural\n"
+        "- sonar emocionalmente específico\n"
+        "- conectar principalmente con el OBJETIVO y no solamente con lo visual\n"
+        "- mantener curiosidad, tensión emocional o identificación\n"
+        "- evitar lenguaje genérico o poético vacío\n\n"
+        "MUY IMPORTANTE:\n\n"
+        "La descripción visual es contexto.\n"
+        "El OBJETIVO es la prioridad absoluta.\n\n"
+        "Ejemplos:\n"
+        "- si el video muestra una playa pero el objetivo es vender tranquilidad, habla del escape emocional\n"
+        "- si el objetivo es destacar una canción, habla de la sensación emocional que transmite\n"
+        "- si el objetivo es generar identificación, habla del pensamiento interno de la persona\n"
+        "- si el objetivo es vender algo, genera deseo indirecto sin sonar anuncio\n\n"
+        "NO inventes:\n"
+        "- artistas\n"
+        "- marcas\n"
+        "- precios\n"
+        "- letras\n"
+        "- historias\n"
+        "- promesas\n"
+        "- nombres no mencionados\n\n"
+        "REGLAS SEGÚN TIPO:\n\n"
+        "- pregunta: usar preguntas abiertas, incómodas o emocionalmente específicas\n"
+        "- curiosidad: abrir loops mentales incompletos\n"
+        "- identificación: hacer sentir “esto literalmente me pasa”\n"
+        "- tensión: crear sensación de conflicto, caos o incomodidad\n"
+        "- vulnerable: sonar íntimo, humano o emocionalmente expuesto\n"
+        "- provocador: atacar ideas comunes o comportamientos normales\n"
+        "- venta suave: crear deseo indirecto sin parecer publicidad\n"
+        "- melancólico: transmitir nostalgia, distancia emocional o vacío\n\n"
+        "PROHIBIDO:\n"
+        "- frases motivacionales vacías\n"
+        "- frases filosóficas genéricas\n"
+        "- clichés tipo mi alma, vibra, pasión, energía, viaje interior, secretos ocultos, nadie habla de esto\n"
+        "- lenguaje corporativo\n"
+        "- frases que podrían funcionar para cualquier video\n"
+        "- describir literalmente lo que se ve\n"
+        "- repetir estructuras\n"
+        "- sonar como IA\n\n"
+        "NO uses:\n"
+        "- comillas\n"
+        "- hashtags\n"
+        "- emojis\n"
+        "- numeración\n"
+        "- títulos\n"
+        "- explicaciones\n\n"
+        "NO menciones:\n"
+        "- TikTok\n"
+        "- Reels\n"
+        "- Shorts\n"
+        "- hooks\n"
+        "- clips\n"
+        "- duración\n"
+        "- segundos\n\n"
+        "La prioridad NO es sonar inteligente.\n\n"
+        "La prioridad es generar una reacción emocional inmediata.\n\n"
+        f"{output_rules}"
     )
 
 
-def ollama_hooks(clips: list[dict], video_context: str) -> tuple[list[str], str]:
+def ollama_batch(
+    count: int,
+    clips: list[dict],
+    video_context: str,
+    hook_objective: str,
+    hook_tone: str,
+    hook_type: str,
+    clip_duration: float,
+) -> list[str]:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
     payload = json.dumps(
         {
             "model": model,
-            "prompt": hooks_prompt(len(clips), video_context),
+            "prompt": hooks_prompt(count, video_context, hook_objective, hook_tone, hook_type, clip_duration),
             "stream": False,
             "format": "json",
+            "options": {"temperature": 0.7, "top_p": 0.9},
         }
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -185,42 +330,85 @@ def ollama_hooks(clips: list[dict], video_context: str) -> tuple[list[str], str]
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             data = json.loads(response.read().decode("utf-8"))
         raw = data.get("response", "")
         parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            parsed = parsed.get("hooks", parsed.get("texts", []))
-        if isinstance(parsed, list):
-            hooks = [str(item).strip() for item in parsed if str(item).strip()]
-            if len(hooks) >= len(clips):
-                return hooks[: len(clips)], "ollama"
+        raw_hooks = extract_hook_list(parsed)
+        if raw_hooks:
+            return normalize_hooks(raw_hooks, clips[:count])
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError):
-        return fallback_hooks(clips, video_context), "local_templates"
-    return fallback_hooks(clips, video_context), "local_templates"
+        return []
+    return []
 
 
-def generate_hooks(clips: list[dict], hook_mode: str, video_context: str, manual_hooks: str) -> tuple[list[str], str]:
+def ollama_hooks(
+    clips: list[dict],
+    video_context: str,
+    hook_objective: str,
+    hook_tone: str,
+    hook_type: str,
+    clip_duration: float,
+) -> tuple[list[str], str]:
+    hooks: list[str] = []
+    batch_size = 5
+    while len(hooks) < len(clips):
+        remaining = len(clips) - len(hooks)
+        batch_count = min(batch_size, remaining)
+        batch_hooks = ollama_batch(
+            batch_count,
+            clips[len(hooks) : len(hooks) + batch_count],
+            video_context,
+            hook_objective,
+            hook_tone,
+            hook_type,
+            clip_duration,
+        )
+        if not batch_hooks:
+            break
+        hooks.extend(batch_hooks[:batch_count])
+
+    if hooks:
+        if len(hooks) < len(clips):
+            hooks = [hooks[index % len(hooks)] for index in range(len(clips))]
+            return hooks[: len(clips)], "ollama_partial"
+        return hooks[: len(clips)], "ollama"
+    raise HTTPException(
+        status_code=502,
+        detail="Ollama no devolvió hooks válidos. Revisa que Ollama esté abierto, que el modelo exista y que la descripción sea clara.",
+    )
+
+
+def generate_hooks(
+    clips: list[dict],
+    hook_mode: str,
+    video_context: str,
+    hook_objective: str,
+    hook_tone: str,
+    hook_type: str,
+    manual_hooks: str,
+    clip_duration: float,
+) -> tuple[list[str], str]:
     if hook_mode == "manual":
         hooks = parse_manual_hooks(manual_hooks, len(clips))
         if hooks:
             return hooks, "manual"
-        return fallback_hooks(clips, video_context), "local_templates"
+        raise HTTPException(status_code=400, detail="Pega al menos un hook para usar el modo manual.")
 
     if hook_mode == "ollama":
-        return ollama_hooks(clips, video_context)
+        return ollama_hooks(clips, video_context, hook_objective, hook_tone, hook_type, clip_duration)
 
-    if hook_mode == "templates":
-        return fallback_hooks(clips, video_context), "local_templates"
+    if hook_mode != "openai":
+        raise HTTPException(status_code=400, detail="Modo de hooks inválido. Usa manual, ollama u openai.")
 
     if not os.getenv("OPENAI_API_KEY"):
-        return fallback_hooks(clips, video_context), "local_templates"
+        raise HTTPException(status_code=400, detail="Falta OPENAI_API_KEY para usar OpenAI API.")
 
     client = OpenAI()
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     prompt = {
         "role": "user",
-        "content": hooks_prompt(len(clips), video_context),
+        "content": hooks_prompt(len(clips), video_context, hook_objective, hook_tone, hook_type, clip_duration),
     }
     try:
         response = client.chat.completions.create(
@@ -233,18 +421,18 @@ def generate_hooks(clips: list[dict], hook_mode: str, video_context: str, manual
         )
         content = response.choices[0].message.content or ""
         parsed = json.loads(content)
-        if isinstance(parsed, list):
-            hooks = [str(item).strip() for item in parsed if str(item).strip()]
+        raw_hooks = extract_hook_list(parsed)
+        if raw_hooks:
+            hooks = normalize_hooks(raw_hooks, clips)
             if len(hooks) >= len(clips):
                 return hooks[: len(clips)], "openai"
-    except Exception:
-        return fallback_hooks(clips, video_context), "local_templates"
-    return fallback_hooks(clips, video_context), "local_templates"
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI no pudo generar hooks: {exc}") from exc
+    raise HTTPException(status_code=502, detail="OpenAI no devolvió hooks válidos.")
 
 
 def clean_hook_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    return re.sub(r"\s*\(\d+(?:\.\d+)?s-\d+(?:\.\d+)?s\)\s*$", "", text).strip()
+    return sanitize_hook(text)
 
 
 def wrap_hook_lines(text: str) -> list[str]:
@@ -252,36 +440,22 @@ def wrap_hook_lines(text: str) -> list[str]:
     return textwrap.wrap(clean_text, width=23) or [clean_text]
 
 
-def ffmpeg_text_value(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace(",", "\\,")
-        .replace("%", "\\%")
-    )
-
-
-def build_centered_text_filter(text: str, font_option: str) -> str:
+def build_centered_text_filter(text: str, font_option: str, text_dir: Path, clip_index: int) -> str:
     lines = wrap_hook_lines(text)
     font_size = 52
     line_gap = 28
     line_step = font_size + line_gap
-    padding_y = 54
-    box_width = 880
-    box_height = max(180, (len(lines) * font_size) + ((len(lines) - 1) * line_gap) + (padding_y * 2))
-    first_line_y = f"(h-{box_height})/2+{padding_y}"
+    text_height = (len(lines) * font_size) + ((len(lines) - 1) * line_gap)
+    first_line_y = f"(h-{text_height})/2"
 
-    filters = [
-        f"drawbox=x=(w-{box_width})/2:y=(h-{box_height})/2:w={box_width}:h={box_height}:color=black@0.52:t=fill"
-    ]
+    filters = []
     for index, line in enumerate(lines):
+        text_path = text_dir / f"clip_{clip_index:03}_line_{index:02}.txt"
+        text_path.write_text(line, encoding="utf-8")
         y_expr = f"{first_line_y}+{index * line_step}"
         filters.append(
-            f"drawtext={font_option}text='{ffmpeg_text_value(line)}':"
-            f"fontcolor=white:fontsize={font_size}:"
+            f"drawtext={font_option}textfile='{ffmpeg_path_value(text_path)}':"
+            f"fontcolor=white:fontsize={font_size}:borderw=5:bordercolor=black:"
             "x=(w-text_w)/2:"
             f"y={y_expr}"
         )
@@ -323,9 +497,41 @@ def health() -> dict:
         "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
         "openai_key": bool(os.getenv("OPENAI_API_KEY")),
         "ollama_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        "default_hook_mode": "openai" if os.getenv("OPENAI_API_KEY") else "local_templates",
+        "default_hook_mode": "openai" if os.getenv("OPENAI_API_KEY") else "ollama",
         "uploads": str(UPLOADS_DIR),
         "outputs": str(OUTPUTS_DIR),
+    }
+
+
+@app.post("/api/prompt-preview")
+async def prompt_preview(
+    clip_duration: float = Form(7),
+    max_clips: int = Form(30),
+    output_format: str = Form("json"),
+    video_context: str = Form(""),
+    hook_objective: str = Form(""),
+    hook_tone: str = Form(""),
+    hook_type: str = Form("curiosidad"),
+) -> dict:
+    return {
+        "inputs": {
+            "clip_duration": clip_duration,
+            "max_clips": max_clips,
+            "output_format": output_format,
+            "video_context": video_context,
+            "hook_objective": hook_objective,
+            "hook_tone": hook_tone,
+            "hook_type": hook_type,
+        },
+        "prompt": hooks_prompt(
+            max_clips,
+            video_context,
+            hook_objective,
+            hook_tone,
+            hook_type,
+            clip_duration,
+            output_format,
+        ),
     }
 
 
@@ -336,48 +542,69 @@ async def create_job(
     max_clips: int = Form(30),
     interval: float = Form(2),
     format: str = Form("vertical_9_16"),
-    hook_mode: str = Form("templates"),
+    hook_mode: str = Form("ollama"),
     video_context: str = Form(""),
+    hook_objective: str = Form(""),
+    hook_tone: str = Form(""),
+    hook_type: str = Form("curiosidad"),
     manual_hooks: str = Form(""),
 ) -> dict:
-    ensure_ffmpeg()
-    if clip_duration <= 0 or interval <= 0 or max_clips <= 0:
-        raise HTTPException(status_code=400, detail="Los valores de configuración deben ser mayores que cero.")
-    if not file.content_type or not file.content_type.startswith("video/"):
-        raise HTTPException(status_code=400, detail="Sube un archivo de video válido.")
+    try:
+        ensure_ffmpeg()
+        if clip_duration <= 0 or interval <= 0 or max_clips <= 0:
+            raise HTTPException(status_code=400, detail="Los valores de configuración deben ser mayores que cero.")
+        if not file.content_type or not file.content_type.startswith("video/"):
+            raise HTTPException(status_code=400, detail="Sube un archivo de video válido.")
 
-    job_id = str(uuid.uuid4())
-    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
-    upload_path = UPLOADS_DIR / f"{job_id}{suffix}"
-    with upload_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        job_id = str(uuid.uuid4())
+        suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+        upload_path = UPLOADS_DIR / f"{job_id}{suffix}"
+        with upload_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    duration = probe_duration(upload_path)
-    clips = build_clip_windows(duration, clip_duration, max_clips, interval)
-    hooks, resolved_hook_mode = generate_hooks(clips, hook_mode, video_context, manual_hooks)
-    for clip, hook in zip(clips, hooks):
-        clip["hook"] = hook
+        duration = probe_duration(upload_path)
+        clips = build_clip_windows(duration, clip_duration, max_clips, interval)
+        hooks, resolved_hook_mode = generate_hooks(
+            clips,
+            hook_mode,
+            video_context,
+            hook_objective,
+            hook_tone,
+            hook_type,
+            manual_hooks,
+            clip_duration,
+        )
+        for clip, hook in zip(clips, hooks):
+            clip["hook"] = hook
 
-    job = {
-        "id": job_id,
-        "original_filename": file.filename,
-        "upload_path": str(upload_path),
-        "duration": round(duration, 2),
-        "settings": {
-            "clip_duration": clip_duration,
-            "max_clips": max_clips,
-            "interval": interval,
-            "format": format,
-            "hook_mode": resolved_hook_mode,
-            "video_context": video_context,
-        },
-        "clips": clips,
-        "status": "ready",
-    }
-    jobs = load_jobs()
-    jobs[job_id] = job
-    save_jobs(jobs)
-    return job
+        job = {
+            "id": job_id,
+            "original_filename": file.filename,
+            "upload_path": str(upload_path),
+            "duration": round(duration, 2),
+            "settings": {
+                "clip_duration": clip_duration,
+                "max_clips": max_clips,
+                "interval": interval,
+                "format": format,
+                "hook_mode": resolved_hook_mode,
+                "video_context": video_context,
+                "hook_objective": hook_objective,
+                "hook_tone": hook_tone,
+                "hook_type": hook_type,
+            },
+            "clips": clips,
+            "status": "ready",
+        }
+        jobs = load_jobs()
+        jobs[job_id] = job
+        save_jobs(jobs)
+        return job
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @app.get("/api/jobs/{job_id}")
@@ -405,6 +632,34 @@ def update_clip(job_id: str, clip_id: str, payload: ClipUpdate) -> dict:
     raise HTTPException(status_code=404, detail="Clip no encontrado.")
 
 
+@app.patch("/api/jobs/{job_id}/clips-status")
+def update_all_clips_status(job_id: str, payload: BulkStatusUpdate) -> dict:
+    jobs = load_jobs()
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado. Genera de nuevo las propuestas.")
+    for clip in job["clips"]:
+        clip["status"] = payload.status
+    save_jobs(jobs)
+    return job
+
+
+@app.patch("/api/jobs/{job_id}/selected-clips-status")
+def update_selected_clips_status(job_id: str, payload: SelectedStatusUpdate) -> dict:
+    jobs = load_jobs()
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado. Genera de nuevo las propuestas.")
+    selected_ids = set(payload.clip_ids)
+    if not selected_ids:
+        raise HTTPException(status_code=400, detail="Selecciona al menos un clip.")
+    for clip in job["clips"]:
+        if clip["id"] in selected_ids:
+            clip["status"] = payload.status
+    save_jobs(jobs)
+    return job
+
+
 @app.post("/api/jobs/{job_id}/render")
 def render_job(job_id: str) -> dict:
     ensure_ffmpeg()
@@ -423,7 +678,11 @@ def render_job(job_id: str) -> dict:
 
     job_output_dir = OUTPUTS_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
+    text_dir = job_output_dir / "_text"
+    text_dir.mkdir(parents=True, exist_ok=True)
 
+    rendered_count = 0
+    render_errors = []
     for clip in approved:
         output_path = job_output_dir / f"clip_{clip['index']:03}.mp4"
         clip["hook"] = clean_hook_text(clip["hook"])
@@ -431,7 +690,7 @@ def render_job(job_id: str) -> dict:
         video_filter = (
             "scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,"
-            f"{build_centered_text_filter(clip['hook'], font_option)}"
+            f"{build_centered_text_filter(clip['hook'], font_option, text_dir, clip['index'])}"
         )
         cmd = [
             "ffmpeg",
@@ -460,11 +719,22 @@ def render_job(job_id: str) -> dict:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"FFmpeg falló renderizando clip {clip['index']}: {result.stderr[-800:]}")
+            error = f"FFmpeg falló renderizando clip {clip['index']}: {result.stderr[-800:]}"
+            clip["render_error"] = error
+            render_errors.append(error)
+            continue
         clip["output_path"] = str(output_path)
+        clip.pop("render_error", None)
+        rendered_count += 1
 
-    job["status"] = "rendered"
+    job["status"] = "rendered_with_errors" if render_errors else "rendered"
+    job["render_errors"] = render_errors
     save_jobs(jobs)
+    if rendered_count == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=render_errors[0] if render_errors else "No se pudo renderizar ningún clip.",
+        )
     return job
 
 
